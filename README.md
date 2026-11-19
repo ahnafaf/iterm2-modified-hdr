@@ -35,6 +35,47 @@ The script clones iTerm2 into `~/src/iTerm2-hdr`, applies
 time) and installs it as `~/Applications/iTerm2 HDR.app`. It is safe to re-run
 after a failure. Set `ITERM_SRC` to use a different checkout directory.
 
+## Staying up to date
+
+iTerm2 changes daily, so the patched build needs to follow it.
+
+```sh
+bash build-iterm2-hdr.sh --update      # once, now
+bash build-iterm2-hdr.sh --schedule    # every week, in the background
+```
+
+`--update` fetches the newest iTerm2, replays the patch on top with git,
+rebuilds and installs. `--schedule` sets up a background job that does the same
+about once a week: it checks daily at 12:30, skips the build on battery, and
+posts a notification when something happens. `--unschedule` removes it. The
+job's log is `~/Library/Logs/iterm2-hdr-update.log`.
+
+The background job runs from its own copy of the script and patch in
+`~/Library/Application Support/iterm2-hdr-update`, because macOS does not let
+background jobs read folders such as Documents. Run `--schedule` again after
+you change the script or the patch.
+
+An update is careful about three things:
+
+- **It never replaces the app while it is running.** If iTerm2 HDR is open, the
+  new build waits and is swapped in as soon as you quit it.
+- **It stops when the patch no longer fits.** If iTerm2 changed the same lines
+  the patch does, the checkout is put back the way it was, the installed app is
+  left alone, and you are told which files collided. That needs a manual
+  rebase of the `hdr-text` branch in the checkout.
+- **It keeps the previous build.** `bash build-iterm2-hdr.sh --rollback` puts
+  back the build the last install replaced, for when a new iTerm2 misbehaves.
+
+It follows iTerm2's development branch, so each update is as stable as that
+day's nightly.
+
+If you maintain your own copy of this repository, add `--push` to `--update` or
+`--schedule`. After an update that built successfully, the script rewrites
+`iterm2-hdr-text.patch` and `base-commit` (the iTerm2 commit the patch was last
+replayed on) when the patch itself changed, then commits and pushes them. With
+`--schedule --push` the job's copy is a clone of your repository's `origin`
+that it pulls before each update, so commit and push before scheduling.
+
 ## Turn it on
 
 1. Quit your normal iTerm2, then open `~/Applications/iTerm2 HDR.app`. Both
@@ -44,8 +85,9 @@ after a failure. Set `ITERM_SRC` to use a different checkout directory.
    setting is per mode.
 3. Settings > General > Magic: untick "Disable GPU rendering when disconnected
    from power" if you want HDR text on battery.
-4. Settings > General: turn off automatic update checks, or Sparkle may replace
-   this build with a stock release.
+4. Settings > General: turn off automatic update checks, or iTerm2's own
+   updater may replace this build with a stock release. Use `--update` or
+   `--schedule` to stay current.
 
 ## When text is boosted
 

@@ -7,6 +7,19 @@ builds a patched copy and installs it next to your normal iTerm2.
 It builds on iTerm2's HDR cursor. Brightness is a multiple of normal white
 (1.5x to 8x, default 3x), applied in linear light, so colours keep their hue.
 
+<!--
+  PHOTO PLACEHOLDER
+  Save a photo of the screen as images/hdr-text.jpg, then delete the
+  "Photo coming soon" line below and remove this comment's opening and closing
+  markers so the image tag is live. It has to be a camera photo: a screenshot
+  cannot capture brightness above white.
+
+![iTerm2 with HDR text in the focused pane, photographed on an HDR display](images/hdr-text.jpg)
+-->
+
+> **Photo coming soon.** A screenshot can't show this, because screenshots
+> don't record brightness above white.
+
 ## Build
 
 You need a Mac with an HDR display and Xcode 26 or newer.
@@ -48,6 +61,48 @@ All of these have to be true:
   "Night Shift" in Settings > Advanced.
 
 The cursor cell and emoji are not boosted.
+
+## How it works
+
+A normal window tops out at "white", which on an HDR display is well below the
+brightest the panel can go. macOS calls the room above white EDR headroom, and
+an app can use it by drawing pixel values greater than 1.0. The patch makes
+only the text do that, so the background stays where it was and the text
+stands out against it.
+
+1. **A framebuffer that can hold values above white.** iTerm2's GPU renderer
+   normally draws into an 8-bit buffer, where 1.0 is the largest value. When a
+   profile has HDR text (or the HDR cursor) on, the session's Metal view
+   switches to a 16-bit float buffer in an extended-range colour space and
+   asks macOS for headroom. The pixel format is baked into the renderer's
+   pipelines, so flipping the setting rebuilds the renderer for that tab.
+
+2. **A gain worked out for every frame.** Before each frame, iTerm2 checks the
+   conditions listed above. If any fails, the gain is 1 and the text draws
+   exactly as before. Otherwise the gain is the brightness you picked, capped
+   at what the display reports it can reach and at 8x. Because this is
+   decided per frame, the glow follows focus as you switch panes, tabs and
+   apps.
+
+3. **The boost happens in the text shader.** For each glyph pixel the shader
+   converts the text colour from sRGB to linear light, multiplies it by the
+   gain, and converts back. Working in linear light is what makes "3x" mean
+   three times the light. If the brightest channel would go past the
+   display's headroom, the whole colour is scaled down together, so a
+   saturated red stays red and doesn't wash out toward white. Underlines
+   get the same boost. Glyph coverage is still computed from the original
+   colour, so text keeps its normal stroke weight.
+
+4. **Night Shift.** macOS has no public API for Night Shift, so the patch
+   loads the private CoreBrightness framework at runtime and asks it whether
+   Night Shift is on. It listens for changes, and also re-checks once a
+   minute and after wake. If that private API is missing or changes, Night
+   Shift is treated as off, so the worst case is HDR text staying on at
+   night.
+
+The patch only holds the display in HDR while HDR text can actually draw. When
+the GPU renderer is off (iTerm2's default on battery) or Night Shift is
+suppressing it, the headroom is released, unless the HDR cursor is also on.
 
 ## License
 

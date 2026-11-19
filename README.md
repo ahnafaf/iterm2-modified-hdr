@@ -70,6 +70,23 @@ an app can use it by drawing pixel values greater than 1.0. The patch makes
 only the text do that, so the background stays where it was and the text
 stands out against it.
 
+```mermaid
+flowchart TD
+    setting["HDR text ticked in the profile"] --> fb["Metal view uses a 16-bit float framebuffer<br/>and asks macOS for HDR headroom"]
+    fb --> check{"Every frame:<br/>focused pane, dark background,<br/>display headroom, Night Shift off?"}
+    check -- "No" --> normal["Gain = 1<br/>text draws as normal"]
+    check -- "Yes" --> gain["Gain = your brightness,<br/>capped at display headroom and 8x"]
+    gain --> linear
+    subgraph shader["Text shader, for each glyph pixel"]
+        linear["Convert text colour<br/>from sRGB to linear light"] --> mult["Multiply by gain"]
+        mult --> clip{"Brightest channel<br/>past headroom?"}
+        clip -- "Yes" --> scale["Scale the whole colour down<br/>so the hue is kept"]
+        clip -- "No" --> encode["Convert back to sRGB"]
+        scale --> encode
+    end
+    encode --> out["Values above 1.0 reach the display<br/>as brighter than white"]
+```
+
 1. **A framebuffer that can hold values above white.** iTerm2's GPU renderer
    normally draws into an 8-bit buffer, where 1.0 is the largest value. When a
    profile has HDR text (or the HDR cursor) on, the session's Metal view

@@ -1,0 +1,1095 @@
+From a5979d7fbddb0d33bf3aabee9186c9dae4349d25 Mon Sep 17 00:00:00 2001
+From: Ahnaf <ahnaf@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:11:46 -0500
+Subject: [PATCH] Add HDR text for the focused pane
+
+Builds on the HDR cursor. A new per-profile setting (Profiles > Colors,
+with light/dark variants like the HDR cursor) draws the focused pane's
+text brighter than reference white on displays with EDR headroom.
+
+- The fp16 framebuffer and EDR engager now turn on for HDR text as well
+  as the HDR cursor.
+- The per-frame state computes a gain only for the focused pane (key
+  window and active session), over a dark default background, when the
+  display has headroom, and not while Night Shift is on (advanced
+  setting hdrTextOffDuringNightShift, default on).
+- The monochrome text fragment shaders apply the gain in linear light and
+  scale the whole color down if a channel would exceed headroom, so hues
+  are preserved. The cursor cell and emoji are not boosted.
+- EDR is only held for HDR text while the Metal renderer is in use.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TFt6v6wHS1u3NS1UtAyQpr
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../iTermRecordingProfileSanitizer.swift      |   2 +
+ sources/Drawing/iTermCursor.h                 |  38 ++++++
+ sources/Drawing/iTermCursor.m                 |  26 ++++
+ sources/Drawing/iTermTextDrawingHelper.h      |   9 ++
+ sources/Drawing/iTermTextDrawingHelper.m      | 113 ++++++++++++++++++
+ .../Glue/iTermMetalPerFrameState.m            |  32 +++++
+ .../Renderers/iTermTextRenderer.mm            |  19 ++-
+ .../iTermTextRendererTransientState.h         |   3 +
+ .../MetalRenderer/Shaders/iTermShaderTypes.h  |  14 ++-
+ sources/MetalRenderer/Shaders/iTermText.metal |  55 ++++++++-
+ sources/MetalRenderer/iTermMetalDriver.h      |   8 ++
+ sources/MetalRenderer/iTermMetalDriver.m      |  20 ++++
+ sources/PTYSession/PTYSession.m               |  23 +++-
+ sources/PTYSession/PTYSession.swift           |   6 +
+ sources/Settings/Profiles/ITAddressBookMgr.h  |   2 +
+ .../ProfilesColorsPreferencesViewController.m |  75 ++++++++++++
+ sources/Settings/iTermAdvancedSettingsModel.h |   1 +
+ sources/Settings/iTermAdvancedSettingsModel.m |   1 +
+ sources/Settings/iTermProfilePreferences.m    |  22 ++++
+ sources/TerminalView/PTYTextView.h            |   2 +
+ sources/TerminalView/PTYTextView.m            |  26 ++++
+ sources/TerminalView/SessionView.h            |  11 ++
+ sources/TerminalView/SessionView.m            |  65 ++++++++--
+ 23 files changed, 554 insertions(+), 19 deletions(-)
+
+diff --git a/sources/Codecs/iTermRecordingProfileSanitizer.swift b/sources/Codecs/iTermRecordingProfileSanitizer.swift
+index c834082f5..b3e7f7324 100644
+--- a/sources/Codecs/iTermRecordingProfileSanitizer.swift
++++ b/sources/Codecs/iTermRecordingProfileSanitizer.swift
+@@ -33,6 +33,8 @@ class iTermRecordingProfileSanitizer: NSObject {
+         KEY_CURSOR_BOOST,
+         KEY_HDR_CURSOR,
+         KEY_HDR_CURSOR_BRIGHTNESS,
++        KEY_HDR_TEXT,
++        KEY_HDR_TEXT_BRIGHTNESS,
+         KEY_USE_ACTIVE_PANE_BORDER,
+ 
+         // Fonts
+diff --git a/sources/Drawing/iTermCursor.h b/sources/Drawing/iTermCursor.h
+index 32fd215ff..8db5ffb2f 100644
+--- a/sources/Drawing/iTermCursor.h
++++ b/sources/Drawing/iTermCursor.h
+@@ -30,6 +30,27 @@ typedef NS_ENUM(NSInteger, ITermCursorType) {
+ // Metal cursor renderer so both request the same peak.
+ extern const CGFloat iTermHDRCursorMaximumBrightness;
+ 
++// HDR text: the focused pane's text is drawn brighter than reference white on a
++// display with EDR headroom. Brightness is a linear multiple of reference white,
++// like the HDR cursor. The default is the profile's KEY_HDR_TEXT_BRIGHTNESS
++// default; the minimum and maximum bound the settings slider and the renderer.
++extern const CGFloat iTermHDRTextDefaultBrightness;
++extern const CGFloat iTermHDRTextMinimumBrightness;
++extern const CGFloat iTermHDRTextMaximumBrightness;
++
++// Posted on the main thread when macOS Night Shift turns on or off.
++extern NSNotificationName const iTermNightShiftDidChangeNotification;
++
++// Tracks whether Night Shift is currently warming the display. Uses the private
++// CoreBrightness CBBlueLightClient, loaded at runtime. If that class is missing
++// or its API changes, Night Shift is reported as off, which only means HDR text
++// stays on at night rather than anything breaking.
++@interface iTermNightShiftMonitor : NSObject
+++ (instancetype)sharedInstance;
++// YES while Night Shift is actively tinting the display (scheduled or manual).
++@property (nonatomic, readonly) BOOL active;
++@end
++
+ @interface iTermCursor : NSObject
+ 
+ @property (nonatomic, assign) id<iTermCursorDelegate> delegate;
+@@ -99,4 +120,21 @@ extern const CGFloat iTermHDRCursorMaximumBrightness;
+ + (CGFloat)hdrCursorComponentValueForRequestedBrightness:(CGFloat)requested
+                                                 headroom:(CGFloat)headroom;
+ 
++// The linear brightness multiplier to draw this pane's text with, or 1.0 for no
++// boost. Text is boosted only when the profile enables HDR text, the pane is the
++// focused one (key window and active session), the default background is dark
++// (on a light background a brighter foreground lowers contrast), the display has
++// EDR headroom, and Night Shift is not suppressing it. `requested` is the
++// profile's KEY_HDR_TEXT_BRIGHTNESS; `headroom` is the screen's
++// maximumPotentialExtendedDynamicRangeColorComponentValue.
+++ (CGFloat)hdrTextGainForRequestedBrightness:(CGFloat)requested
++                              profileEnabled:(BOOL)profileEnabled
++                                     focused:(BOOL)focused
++                                  background:(NSColor *)backgroundColor
++                           potentialHeadroom:(CGFloat)headroom;
++
++// YES when HDR text is turned off right now because Night Shift is on and the
++// advanced setting asks for that. Shared by the renderer and the EDR engager.
+++ (BOOL)hdrTextSuppressedByNightShift;
++
+ @end
+diff --git a/sources/Drawing/iTermCursor.m b/sources/Drawing/iTermCursor.m
+index 43fc9e860..b08be8047 100644
+--- a/sources/Drawing/iTermCursor.m
++++ b/sources/Drawing/iTermCursor.m
+@@ -14,6 +14,9 @@
+ #import "iTermVirtualOffset.h"
+ 
+ const CGFloat iTermHDRCursorMaximumBrightness = 16.0;
++const CGFloat iTermHDRTextDefaultBrightness = 3.0;
++const CGFloat iTermHDRTextMinimumBrightness = 1.5;
++const CGFloat iTermHDRTextMaximumBrightness = 8.0;
+ 
+ @interface iTermUnderlineCursor : iTermCursor
+ @end
+@@ -243,6 +246,29 @@ const CGFloat iTermHDRCursorMaximumBrightness = 16.0;
+     return 1.055 * pow(linear, 1.0 / 2.4) - 0.055;
+ }
+ 
+++ (CGFloat)hdrTextGainForRequestedBrightness:(CGFloat)requested
++                              profileEnabled:(BOOL)profileEnabled
++                                     focused:(BOOL)focused
++                                  background:(NSColor *)backgroundColor
++                           potentialHeadroom:(CGFloat)headroom {
++    if (!profileEnabled || !focused || headroom <= 1) {
++        return 1.0;
++    }
++    // Brightening the foreground only adds contrast over a dark background.
++    if (!backgroundColor.isDark) {
++        return 1.0;
++    }
++    if ([self hdrTextSuppressedByNightShift]) {
++        return 1.0;
++    }
++    return MAX(1.0, MIN(MIN(requested, headroom), iTermHDRTextMaximumBrightness));
++}
++
+++ (BOOL)hdrTextSuppressedByNightShift {
++    return ([iTermAdvancedSettingsModel hdrTextOffDuringNightShift] &&
++            [[iTermNightShiftMonitor sharedInstance] active]);
++}
++
+ @end
+ 
+ @implementation iTermCopyModeCursor
+diff --git a/sources/Drawing/iTermTextDrawingHelper.h b/sources/Drawing/iTermTextDrawingHelper.h
+index 60ed9552b..e0fd54ada 100644
+--- a/sources/Drawing/iTermTextDrawingHelper.h
++++ b/sources/Drawing/iTermTextDrawingHelper.h
+@@ -183,6 +183,15 @@ extern const CGFloat iTermCursorGuideAlphaThreshold;
+ // in units of reference white. Clamped to the display's headroom when drawn.
+ @property(nonatomic) CGFloat hdrCursorBrightness;
+ 
++// The profile's HDR-text hint (KEY_HDR_TEXT). When on, the focused pane's text is
++// drawn brighter than white on a display with EDR headroom and a dark background.
++// Metal renderer only.
++@property(nonatomic) BOOL hdrTextEnabled;
++
++// The profile's requested HDR text brightness (KEY_HDR_TEXT_BRIGHTNESS), in units
++// of reference white. Clamped to the display's headroom when drawn.
++@property(nonatomic) CGFloat hdrTextBrightness;
++
+ // When YES, a blinking cursor fades smoothly in and out (with dwell times at
+ // the extremes) instead of toggling abruptly. The durations and curves below
+ // are honored only when this is YES.
+diff --git a/sources/Drawing/iTermTextDrawingHelper.m b/sources/Drawing/iTermTextDrawingHelper.m
+index e50ef46f3..84a80f8ae 100644
+--- a/sources/Drawing/iTermTextDrawingHelper.m
++++ b/sources/Drawing/iTermTextDrawingHelper.m
+@@ -8,6 +8,9 @@
+ 
+ #import "iTermTextDrawingHelper.h"
+ 
++#import <dlfcn.h>
++#import <objc/message.h>
++
+ #import "charmaps.h"
+ #import "CVector.h"
+ #import "DebugLogging.h"
+@@ -4830,3 +4833,113 @@ typedef struct {
+ }
+ 
+ @end
++
++#pragma mark - Night Shift
++
++// Lives here (an ARC file) rather than in iTermCursor.m, which is built without ARC.
++NSNotificationName const iTermNightShiftDidChangeNotification = @"iTermNightShiftDidChangeNotification";
++
++@interface iTermNightShiftMonitor()
++- (void)refresh;
++@end
++
++@implementation iTermNightShiftMonitor {
++    id _client;
++    BOOL _active;
++    NSTimer *_pollTimer;
++}
++
+++ (instancetype)sharedInstance {
++    static iTermNightShiftMonitor *instance;
++    static dispatch_once_t onceToken;
++    dispatch_once(&onceToken, ^{
++        instance = [[self alloc] init];
++    });
++    return instance;
++}
++
++- (instancetype)init {
++    self = [super init];
++    if (self) {
++        // CoreBrightness is a private framework, so load it and look the class
++        // up at runtime. Everything below degrades to "Night Shift is off" if it
++        // is unavailable.
++        dlopen("/System/Library/PrivateFrameworks/CoreBrightness.framework/CoreBrightness", RTLD_LAZY);
++        Class clientClass = NSClassFromString(@"CBBlueLightClient");
++        if (clientClass) {
++            _client = [[clientClass alloc] init];
++        }
++        _active = [self readActive];
++        DLog(@"Night Shift monitor started. client=%@ active=%@", _client, @(_active));
++
++        __weak __typeof(self) weakSelf = self;
++        SEL notificationSelector = NSSelectorFromString(@"setStatusNotificationBlock:");
++        if (_client && [_client respondsToSelector:notificationSelector]) {
++            void (^block)(void) = ^{
++                // Called on a CoreBrightness queue.
++                dispatch_async(dispatch_get_main_queue(), ^{
++                    [weakSelf refresh];
++                });
++            };
++            ((void (*)(id, SEL, id))objc_msgSend)(_client, notificationSelector, block);
++        }
++        // The status block is private API, so also poll slowly and re-check on
++        // wake in case it stops firing on some macOS version.
++        dispatch_async(dispatch_get_main_queue(), ^{
++            __strong __typeof(self) strongSelf = weakSelf;
++            if (!strongSelf || !strongSelf->_client) {
++                return;
++            }
++            strongSelf->_pollTimer = [NSTimer scheduledTimerWithTimeInterval:60
++                                                                     repeats:YES
++                                                                       block:^(NSTimer * _Nonnull timer) {
++                [weakSelf refresh];
++            }];
++            [[[NSWorkspace sharedWorkspace] notificationCenter] addObserver:strongSelf
++                                                                   selector:@selector(refresh)
++                                                                       name:NSWorkspaceDidWakeNotification
++                                                                     object:nil];
++        });
++    }
++    return self;
++}
++
++- (BOOL)active {
++    return _active;
++}
++
++// Reads CBBlueLightClient's status. The struct is private and starts with two
++// one-byte BOOLs. The first stays set whenever a Night Shift schedule is
++// configured, even at midday, so it cannot be used. The second is set only while
++// Night Shift is actually on (scheduled or manual), and is the only field read
++// here. The buffer is much larger than the struct so a future layout that grows
++// cannot write past it.
++- (BOOL)readActive {
++    if (!_client) {
++        return NO;
++    }
++    SEL statusSelector = NSSelectorFromString(@"getBlueLightStatus:");
++    if (![_client respondsToSelector:statusSelector]) {
++        return NO;
++    }
++    uint64_t buffer[32];
++    memset(buffer, 0, sizeof(buffer));
++    const BOOL ok = ((BOOL (*)(id, SEL, void *))objc_msgSend)(_client, statusSelector, buffer);
++    if (!ok) {
++        return NO;
++    }
++    return ((const unsigned char *)buffer)[1] != 0;
++}
++
++- (void)refresh {
++    const BOOL active = [self readActive];
++    if (active == _active) {
++        return;
++    }
++    DLog(@"Night Shift active changed to %@", @(active));
++    _active = active;
++    [[NSNotificationCenter defaultCenter] postNotificationName:iTermNightShiftDidChangeNotification
++                                                        object:nil];
++}
++
++@end
+diff --git a/sources/MetalRenderer/Glue/iTermMetalPerFrameState.m b/sources/MetalRenderer/Glue/iTermMetalPerFrameState.m
+index 875aa93a0..07aecb094 100644
+--- a/sources/MetalRenderer/Glue/iTermMetalPerFrameState.m
++++ b/sources/MetalRenderer/Glue/iTermMetalPerFrameState.m
+@@ -123,6 +123,11 @@ typedef struct {
+     iTermMetalCursorInfo *_cursorInfo;
+     NSTimeInterval _timeSinceCursorMoved;
+ 
++    // HDR text: linear brightness multiplier for this frame's text (1 = off) and
++    // the display's potential EDR headroom, which caps it.
++    float _hdrTextGain;
++    float _hdrTextHeadroom;
++
+     // Geometry
+     CGRect _documentVisibleRect;
+     NSRect _adjustedDocumentVisibleRect;
+@@ -240,6 +245,7 @@ typedef struct {
+     [textView smearCursorIfNeededWithDrawingHelper:drawingHelper];
+ 
+     [self loadCursorInfoWithDrawingHelper:drawingHelper textView:textView];
++    [self loadHDRTextWithDrawingHelper:drawingHelper textView:textView];
+     [self loadBackgroundImageWithGlue:glue];
+     [self loadMarkedTextWithDrawingHelper:drawingHelper];
+     [self loadIndicatorsFromTextView:textView drawingHelper:drawingHelper];
+@@ -350,6 +356,22 @@ typedef struct {
+     return [_configuration->_colorMap fastProcessedBackgroundColorForBackgroundColor:unprocessedBackgroundColor];
+ 
+ }
++// Decide whether this frame's text is drawn as HDR. Only the focused pane (the
++// active session in the key window, the same test the cursor uses to decide
++// between a filled and a hollow box) is boosted, so switching tabs, panes, or
++// apps moves the glow with focus.
++- (void)loadHDRTextWithDrawingHelper:(iTermTextDrawingHelper *)drawingHelper
++                            textView:(PTYTextView *)textView {
++    const CGFloat potentialEDR = textView.window.screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
++    const BOOL focused = (_configuration->_isInKeyWindow && _configuration->_textViewIsActiveSession);
++    _hdrTextHeadroom = MAX(1.0, potentialEDR);
++    _hdrTextGain = [iTermCursor hdrTextGainForRequestedBrightness:drawingHelper.hdrTextBrightness
++                                                   profileEnabled:drawingHelper.hdrTextEnabled
++                                                          focused:focused
++                                                       background:[drawingHelper defaultBackgroundColor]
++                                                potentialHeadroom:potentialEDR];
++}
++
+ - (void)loadCursorInfoWithDrawingHelper:(iTermTextDrawingHelper *)drawingHelper
+                                textView:(PTYTextView *)textView {
+     const CGFloat potentialEDR = textView.window.screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+@@ -1011,6 +1033,16 @@ ambiguousIsDoubleWidth:(BOOL)ambiguousIsDoubleWidth
+     return _cursorInfo;
+ }
+ 
++// Private queue
++- (float)metalDriverHDRTextGain {
++    return _hdrTextGain;
++}
++
++// Private queue
++- (float)metalDriverHDRTextHeadroom {
++    return _hdrTextHeadroom;
++}
++
+ // Private queue
+ - (iTermImageWrapper *)metalBackgroundImageGetMode:(nullable iTermBackgroundImageMode *)mode {
+     if (mode) {
+diff --git a/sources/MetalRenderer/Renderers/iTermTextRenderer.mm b/sources/MetalRenderer/Renderers/iTermTextRenderer.mm
+index d9d803ddf..a030093bf 100644
+--- a/sources/MetalRenderer/Renderers/iTermTextRenderer.mm
++++ b/sources/MetalRenderer/Renderers/iTermTextRenderer.mm
+@@ -79,6 +79,7 @@ static BOOL gMonochromeText;
+     iTermMetalBufferPool *_dimensionsPool;
+     iTermMetalBufferPool *_textInfoPool;
+     iTermMetalBufferPool *_cursorInfoPool;
++    iTermMetalBufferPool *_hdrInfoPool;
+     iTermMetalMixedSizeBufferPool *_piuPool;
+ }
+ 
+@@ -198,6 +199,7 @@ static BOOL gMonochromeText;
+         _dimensionsPool = [[iTermMetalBufferPool alloc] initWithDevice:device bufferSize:sizeof(iTermTextureDimensions)];
+         _textInfoPool = [[iTermMetalBufferPool alloc] initWithDevice:device bufferSize:sizeof(iTermVertexTextInfoStruct)];
+         _cursorInfoPool = [[iTermMetalBufferPool alloc] initWithDevice:device bufferSize:sizeof(iTermTextCursorInfo)];
++        _hdrInfoPool = [[iTermMetalBufferPool alloc] initWithDevice:device bufferSize:sizeof(iTermTextHDRInfo)];
+ 
+         // Allow the pool to reserve up to this many bytes. Work backward to find the largest number
+         // of buffers we are OK with keeping permanently allocated. By having enough characters on
+@@ -436,6 +438,20 @@ static NSString *const VertexFunctionName(const BOOL &underlined,
+                                                                 checkIfChanged:YES];
+     cursorInfoBuffer.label = @"Text cursor info";
+ 
++    // Bound for every draw because the monochrome text fragment shaders always
++    // read it. A gain of 1 (or the zeroed default) leaves colors unchanged.
++    iTermTextHDRInfo hdrInfo = tState.hdrTextInfo;
++    if (!(hdrInfo.gain > 1)) {
++        hdrInfo.gain = 1;
++    }
++    if (!(hdrInfo.headroom >= 1)) {
++        hdrInfo.headroom = 1;
++    }
++    id<MTLBuffer> hdrInfoBuffer = [_hdrInfoPool requestBufferFromContext:tState.poolContext
++                                                               withBytes:&hdrInfo
++                                                          checkIfChanged:YES];
++    hdrInfoBuffer.label = @"Text HDR info";
++
+     [tState enumerateDraws:^(const iTermTextPIU *pius,
+                              NSInteger instances,
+                              id<MTLTexture> texture,
+@@ -512,7 +528,8 @@ static NSString *const VertexFunctionName(const BOOL &underlined,
+             tState.pipelineState = [self->_cellRenderer pipelineState];
+             NSDictionary *fragmentBuffers;
+             fragmentBuffers = @{ @(iTermFragmentInputIndexTextureDimensions): textureDimensionsBuffer,
+-                                 @(iTermFragmentInputIndexTextCursor): cursorInfoBuffer };
++                                 @(iTermFragmentInputIndexTextCursor): cursorInfoBuffer,
++                                 @(iTermFragmentInputIndexTextHDR): hdrInfoBuffer };
+             [self->_cellRenderer drawWithTransientState:tState
+                                           renderEncoder:frameData.renderEncoder
+                                        numberOfVertices:6
+diff --git a/sources/MetalRenderer/Renderers/iTermTextRendererTransientState.h b/sources/MetalRenderer/Renderers/iTermTextRendererTransientState.h
+index 09301e3e7..a0a761d8b 100644
+--- a/sources/MetalRenderer/Renderers/iTermTextRendererTransientState.h
++++ b/sources/MetalRenderer/Renderers/iTermTextRendererTransientState.h
+@@ -34,6 +34,9 @@ NS_ASSUME_NONNULL_BEGIN
+ // cell but draws over the previous cell, only takes the cursor color inside
+ // the cursor. Must be set before rows are added. Issue 13203.
+ @property (nonatomic) iTermTextCursorInfo cursorTextInfo;
++// HDR text boost for this frame; see iTermTextHDRInfo. Defaults to zeros, which
++// the renderer treats as no boost.
++@property (nonatomic) iTermTextHDRInfo hdrTextInfo;
+ 
+ // `count` contiguous visual columns starting at `firstColumn` on `row` are
+ // covered by the box cursor. `colors` gives their normal text colors. `count`
+diff --git a/sources/MetalRenderer/Shaders/iTermShaderTypes.h b/sources/MetalRenderer/Shaders/iTermShaderTypes.h
+index 96c96db56..2d1cffc41 100644
+--- a/sources/MetalRenderer/Shaders/iTermShaderTypes.h
++++ b/sources/MetalRenderer/Shaders/iTermShaderTypes.h
+@@ -32,7 +32,8 @@ typedef enum {
+     iTermFragmentInputIndexAlpha = 5,  // float4 pointer. Used by transparent windows on 10.14
+     iTermFragmentInputIndexColor = 6,  // float4. Gives color for letterboxes/pillarboxes
+     iTermFragmentBufferIndexScale = 7,  // backing scale factor float
+-    iTermFragmentInputIndexTextCursor = 8  // Points at iTermTextCursorInfo
++    iTermFragmentInputIndexTextCursor = 8,  // Points at iTermTextCursorInfo
++    iTermFragmentInputIndexTextHDR = 9  // Points at iTermTextHDRInfo
+ } iTermFragmentBufferIndex;
+ 
+ // AND with mask to remove strikethrough bit
+@@ -166,6 +167,17 @@ typedef struct {
+     int enabled;
+ } iTermTextCursorInfo;
+ 
++// HDR text. The text fragment shaders multiply a glyph's color, in linear light,
++// by `gain` so it can render brighter than reference white. 1 means no boost.
++// The framebuffer is fp16 in an extended sRGB-curve color space whenever gain can
++// exceed 1, so the result is re-encoded with the sRGB transfer function.
++typedef struct {
++    float gain;
++    // The display's potential EDR headroom. A boosted color is scaled down as a
++    // whole so its largest channel stays at or below this, keeping its hue.
++    float headroom;
++} iTermTextHDRInfo;
++
+ // A box cursor is at most two cells wide, so while sliding it overlaps at most
+ // three columns.
+ #define iTermBoxCursorMaxColumns 3
+diff --git a/sources/MetalRenderer/Shaders/iTermText.metal b/sources/MetalRenderer/Shaders/iTermText.metal
+index a0f6492b4..e282e3284 100644
+--- a/sources/MetalRenderer/Shaders/iTermText.metal
++++ b/sources/MetalRenderer/Shaders/iTermText.metal
+@@ -22,6 +22,45 @@ static float4 iTermAlphaVectorForTextColor(float4 textColor) {
+     }
+ }
+ 
++#pragma mark - HDR text
++
++// sRGB transfer function (encoded -> linear light), valid for the extended range
++// too. Both branches are evaluated; select() keeps the one that applies, so the
++// pow of a near-zero base in the unused branch is harmless.
++static float3 iTermSRGBToLinear(float3 encoded) {
++    const float3 c = max(encoded, float3(0));
++    const float3 low = c / 12.92;
++    const float3 high = powr((c + 0.055) / 1.055, float3(2.4));
++    return select(high, low, c <= 0.04045);
++}
++
++// Inverse of iTermSRGBToLinear. Values above 1 encode to above 1, which the fp16
++// extended-range framebuffer shows brighter than reference white.
++static float3 iTermLinearToSRGB(float3 linear) {
++    const float3 l = max(linear, float3(0));
++    const float3 low = l * 12.92;
++    const float3 high = 1.055 * powr(l, float3(1.0 / 2.4)) - 0.055;
++    return select(high, low, l <= 0.0031308);
++}
++
++// Brightens a text color for HDR text. The gain is applied in linear light so
++// "3x" means three times the light, like the HDR cursor's brightness. If the
++// brightest channel would pass the display's headroom, the whole color is scaled
++// down together instead of letting that channel clip, so the hue stays the same.
++static float3 iTermHDRBoostTextColor(float3 encoded, constant iTermTextHDRInfo *hdrInfo) {
++    const float gain = hdrInfo->gain;
++    if (gain <= 1.0) {
++        return encoded;
++    }
++    const float3 linear = iTermSRGBToLinear(encoded);
++    const float peak = max(linear.x, max(linear.y, linear.z));
++    float effectiveGain = gain;
++    if (peak > 0.0) {
++        effectiveGain = min(gain, max(1.0, hdrInfo->headroom / peak));
++    }
++    return iTermLinearToSRGB(linear * effectiveGain);
++}
++
+ // Is a fragment at `gridPosition` inside the cell under a filled box cursor?
+ static bool iTermTextIsUnderCursor(float2 gridPosition,
+                                    constant iTermTextCursorInfo *cursorInfo) {
+@@ -325,16 +364,21 @@ iTermTextFragmentShaderMonochrome(iTermTextVertexFunctionOutputMonochrome in [[s
+                                   texture2d<float> texture [[ texture(iTermTextureIndexPrimary) ]],
+                                   texture2d<float> drawable [[ texture(iTermTextureIndexBackground) ]],
+                                   constant iTermTextureDimensions *dimensions  [[ buffer(iTermFragmentInputIndexTextureDimensions) ]],
+-                                  constant iTermTextCursorInfo *cursorInfo [[ buffer(iTermFragmentInputIndexTextCursor) ]]) {
++                                  constant iTermTextCursorInfo *cursorInfo [[ buffer(iTermFragmentInputIndexTextCursor) ]],
++                                  constant iTermTextHDRInfo *hdrInfo [[ buffer(iTermFragmentInputIndexTextHDR) ]]) {
+     constexpr sampler textureSampler(mag_filter::linear,
+                                      min_filter::linear);
+ 
+     float4 textureColor = texture.sample(textureSampler, in.textureCoordinate);
+     float4 result = in.textColor;
++    // Glyph weight comes from the original color (via the vertex shader), so HDR
++    // text keeps the same stroke weight as normal text.
+     float4 alphaVector = in.alphaVector;
+     if (iTermTextIsUnderCursor(in.gridPosition, cursorInfo)) {
+         result = cursorInfo->color;
+         alphaVector = iTermAlphaVectorForTextColor(result);
++    } else {
++        result.xyz = iTermHDRBoostTextColor(result.xyz, hdrInfo);
+     }
+     result.w = dot(textureColor, alphaVector);
+     result.xyz *= result.w;
+@@ -406,7 +450,8 @@ iTermTextFragmentShaderMonochromeUnderlined(iTermTextVertexFunctionOutput in [[s
+                                             texture2d<float> texture [[ texture(iTermTextureIndexPrimary) ]],
+                                             texture2d<float> drawable [[ texture(iTermTextureIndexBackground) ]],
+                                             constant iTermTextureDimensions *dimensions  [[ buffer(iTermFragmentInputIndexTextureDimensions) ]],
+-                                            constant iTermTextCursorInfo *cursorInfo [[ buffer(iTermFragmentInputIndexTextCursor) ]]) {
++                                            constant iTermTextCursorInfo *cursorInfo [[ buffer(iTermFragmentInputIndexTextCursor) ]],
++                                            constant iTermTextHDRInfo *hdrInfo [[ buffer(iTermFragmentInputIndexTextHDR) ]]) {
+     constexpr sampler textureSampler(mag_filter::linear,
+                                      min_filter::linear);
+ 
+@@ -454,15 +499,19 @@ iTermTextFragmentShaderMonochromeUnderlined(iTermTextVertexFunctionOutput in [[s
+                                                                   in.successorWillBeUnderlined);
+ 
+     float4 recoloredTextColor = in.textColor;
++    float4 underlineColor = in.underlineColor;
+     float4 alphaVector = in.alphaVector;
+     if (iTermTextIsUnderCursor(in.gridPosition, cursorInfo)) {
+         recoloredTextColor = cursorInfo->color;
+         alphaVector = iTermAlphaVectorForTextColor(recoloredTextColor);
++    } else {
++        recoloredTextColor.xyz = iTermHDRBoostTextColor(recoloredTextColor.xyz, hdrInfo);
++        underlineColor.xyz = iTermHDRBoostTextColor(underlineColor.xyz, hdrInfo);
+     }
+     recoloredTextColor.w = dot(textureColor, alphaVector);
+ 
+     float4 result = mix(recoloredTextColor,
+-                       in.underlineColor,
++                       underlineColor,
+                        max(strikethroughWeight, underlineWeight));
+     result.xyz *= result.w;
+     return result;
+diff --git a/sources/MetalRenderer/iTermMetalDriver.h b/sources/MetalRenderer/iTermMetalDriver.h
+index c476f155a..981a966cf 100644
+--- a/sources/MetalRenderer/iTermMetalDriver.h
++++ b/sources/MetalRenderer/iTermMetalDriver.h
+@@ -188,6 +188,14 @@ NS_ASSUME_NONNULL_BEGIN
+ 
+ - (nullable iTermMetalCursorInfo *)metalDriverCursorInfo;
+ 
++// Linear brightness multiplier for this frame's text, 1 for normal text. Above 1
++// only when HDR text applies (profile KEY_HDR_TEXT, focused pane, dark
++// background, display headroom, not suppressed by Night Shift).
++- (float)metalDriverHDRTextGain;
++// The display's potential EDR headroom (>= 1). The text shader scales a color
++// down as a whole so no channel goes past this, which keeps hues intact.
++- (float)metalDriverHDRTextHeadroom;
++
+ - (nullable NSDictionary<NSNumber *, iTermCharacterBitmap *> *)metalImagesForGlyphKey:(iTermMetalGlyphKey *)glyphKey
+                                                                           asciiOffset:(CGSize)asciiOffset
+                                                                                  size:(CGSize)size
+diff --git a/sources/MetalRenderer/iTermMetalDriver.m b/sources/MetalRenderer/iTermMetalDriver.m
+index bb80c7fd1..3afae74b5 100644
+--- a/sources/MetalRenderer/iTermMetalDriver.m
++++ b/sources/MetalRenderer/iTermMetalDriver.m
+@@ -1654,6 +1654,25 @@ panelReservationPoints:(CGFloat)panelReservationPoints {
+            normalTextColors:cursorInfo.normalTextColors];
+ }
+ 
++// Tells the text renderer how much to brighten this frame's text. Only nonzero
++// work when the framebuffer is fp16: with an 8-bit framebuffer anything above
++// reference white would just clip, so the gain is forced to 1 there.
++- (void)configureHDRTextForTextState:(iTermTextRendererTransientState *)textState
++                           frameData:(iTermMetalFrameData *)frameData {
++    iTermTextHDRInfo info;
++    memset(&info, 0, sizeof(info));
++    info.gain = 1;
++    info.headroom = 1;
++    if (_framebufferPixelFormat == MTLPixelFormatRGBA16Float) {
++        const float gain = [frameData.perFrameState metalDriverHDRTextGain];
++        if (gain > 1) {
++            info.gain = gain;
++            info.headroom = MAX(1, [frameData.perFrameState metalDriverHDRTextHeadroom]);
++        }
++    }
++    textState.hdrTextInfo = info;
++}
++
+ // The meaning of drawOffscreenCommandLine is:
+ //   nil - just draw
+ //   @YES - draw only first line
+@@ -1693,6 +1712,7 @@ panelReservationPoints:(CGFloat)panelReservationPoints {
+     [self configureCursorTextForTextState:textState
+                                 frameData:frameData
+                  drawOffscreenCommandLine:drawOffscreenCommandLine.boolValue];
++    [self configureHDRTextForTextState:textState frameData:frameData];
+     textState.suppressedTopHeight = suppressedTopHeight;
+     [frameData.rows enumerateObjectsUsingBlock:^(iTermMetalRowData * _Nonnull rowData, NSUInteger idx, BOOL * _Nonnull stop) {
+         NSRange markedRangeOnLine = NSMakeRange(NSNotFound, 0);
+diff --git a/sources/PTYSession/PTYSession.m b/sources/PTYSession/PTYSession.m
+index a17e8ecbc..42daaf65d 100644
+--- a/sources/PTYSession/PTYSession.m
++++ b/sources/PTYSession/PTYSession.m
+@@ -6378,14 +6378,25 @@ webViewConfiguration:(WKWebViewConfiguration *)webViewConfiguration
+     self.textview.hdrCursorEnabled = hdrCursorEnabled;
+     self.textview.hdrCursorBrightness = [iTermProfilePreferences floatForKey:iTermAmendedColorKey(KEY_HDR_CURSOR_BRIGHTNESS, aDict, dark)
+                                                                    inProfile:aDict];
++    const BOOL hdrTextEnabled = [iTermProfilePreferences boolForKey:iTermAmendedColorKey(KEY_HDR_TEXT, aDict, dark)
++                                                          inProfile:aDict];
++    self.textview.hdrTextEnabled = hdrTextEnabled;
++    self.textview.hdrTextBrightness = [iTermProfilePreferences floatForKey:iTermAmendedColorKey(KEY_HDR_TEXT_BRIGHTNESS, aDict, dark)
++                                                                 inProfile:aDict];
++    const BOOL hadHDRFramebuffer = _view.wantsHDRFramebuffer;
+     if (_view.hdrCursorEnabled != hdrCursorEnabled) {
+         _view.hdrCursorEnabled = hdrCursorEnabled;
+-        // The metal framebuffer pixel format is fp16 only when the HDR cursor is
+-        // on, and it is baked into the driver's pipeline states at creation time.
+-        // So a change while metal is active needs a driver rebuild; bounceMetal
+-        // tears the tab's metal views down and rebuilds them with the new
+-        // per-session format. The legacy renderer reads the setting per draw and
+-        // needs no rebuild.
++    }
++    if (_view.hdrTextEnabled != hdrTextEnabled) {
++        _view.hdrTextEnabled = hdrTextEnabled;
++    }
++    if (_view.wantsHDRFramebuffer != hadHDRFramebuffer) {
++        // The metal framebuffer pixel format is fp16 only when the HDR cursor or
++        // HDR text is on, and it is baked into the driver's pipeline states at
++        // creation time. So a change while metal is active needs a driver
++        // rebuild; bounceMetal tears the tab's metal views down and rebuilds them
++        // with the new per-session format. The legacy renderer reads the setting
++        // per draw and needs no rebuild.
+         if (_useMetal) {
+             [self.delegate sessionRebuildMetal];
+         }
+diff --git a/sources/PTYSession/PTYSession.swift b/sources/PTYSession/PTYSession.swift
+index b07de02b9..944707bde 100644
+--- a/sources/PTYSession/PTYSession.swift
++++ b/sources/PTYSession/PTYSession.swift
+@@ -1579,6 +1579,12 @@ extension PTYSession {
+             KEY_HDR_CURSOR_BRIGHTNESS: nullValue,
+             KEY_HDR_CURSOR_BRIGHTNESS + COLORS_LIGHT_MODE_SUFFIX: nullValue,
+             KEY_HDR_CURSOR_BRIGHTNESS + COLORS_DARK_MODE_SUFFIX: nullValue,
++            KEY_HDR_TEXT: nullValue,
++            KEY_HDR_TEXT + COLORS_LIGHT_MODE_SUFFIX: nullValue,
++            KEY_HDR_TEXT + COLORS_DARK_MODE_SUFFIX: nullValue,
++            KEY_HDR_TEXT_BRIGHTNESS: nullValue,
++            KEY_HDR_TEXT_BRIGHTNESS + COLORS_LIGHT_MODE_SUFFIX: nullValue,
++            KEY_HDR_TEXT_BRIGHTNESS + COLORS_DARK_MODE_SUFFIX: nullValue,
+             KEY_ANSI_0_COLOR: nullValue,
+             KEY_ANSI_0_COLOR + COLORS_LIGHT_MODE_SUFFIX: nullValue,
+             KEY_ANSI_0_COLOR + COLORS_DARK_MODE_SUFFIX: nullValue,
+diff --git a/sources/Settings/Profiles/ITAddressBookMgr.h b/sources/Settings/Profiles/ITAddressBookMgr.h
+index 8b10f90d8..c8699ca98 100644
+--- a/sources/Settings/Profiles/ITAddressBookMgr.h
++++ b/sources/Settings/Profiles/ITAddressBookMgr.h
+@@ -130,6 +130,8 @@
+ #define KEY_CURSOR_BOOST           @"Cursor Boost"
+ #define KEY_HDR_CURSOR             @"HDR Cursor"
+ #define KEY_HDR_CURSOR_BRIGHTNESS  @"HDR Cursor Brightness"
++#define KEY_HDR_TEXT               @"HDR Text"
++#define KEY_HDR_TEXT_BRIGHTNESS    @"HDR Text Brightness"
+ #define KEY_USE_CURSOR_GUIDE       @"Use Cursor Guide"
+ #define KEY_CURSOR_GUIDE_COLOR     @"Cursor Guide Color"
+ #define KEY_BADGE_COLOR            @"Badge Color"
+diff --git a/sources/Settings/ProfilesColorsPreferencesViewController.m b/sources/Settings/ProfilesColorsPreferencesViewController.m
+index 68b4bf872..99c2eab44 100644
+--- a/sources/Settings/ProfilesColorsPreferencesViewController.m
++++ b/sources/Settings/ProfilesColorsPreferencesViewController.m
+@@ -11,6 +11,7 @@
+ #import "iTerm2SharedARC-Swift.h"
+ #import "ITAddressBookMgr.h"
+ #import "iTermColorPresets.h"
++#import "iTermCursor.h"
+ #import "iTermDynamicProfileManager.h"
+ #import "iTermPreferenceDidChangeNotification.h"
+ #import "iTermProfilePreferences.h"
+@@ -100,6 +101,10 @@ static NSString * const kColorGalleryURL = @"https://www.iterm2.com/colorgallery
+     IBOutlet NSButton *_useSmartCursorColor;
+     IBOutlet NSButton *_hdrCursor;
+     IBOutlet NSSlider *_hdrCursorBrightness;
++    // HDR text controls. Created in code (see -installHDRTextControls) beside the
++    // HDR cursor controls rather than in PreferencePanel.xib.
++    NSButton *_hdrText;
++    NSSlider *_hdrTextBrightness;
+     IBOutlet NSButton *_useThemeMarkColors;
+     IBOutlet NSButton *_useActivePaneBorder;
+     IBOutlet iTermSettingsColorWell *_activePaneBorderColor;
+@@ -286,6 +291,18 @@ static NSString * const kColorGalleryURL = @"https://www.iterm2.com/colorgallery
+                           type:kPreferenceInfoTypeCheckbox];
+     info.observer = ^() { [weakSelf updateColorControlsEnabled]; };
+ 
++    [self installHDRTextControls];
++    info = [self defineControl:_hdrText
++                           key:KEY_HDR_TEXT
++                   relatedView:nil
++                          type:kPreferenceInfoTypeCheckbox];
++    info.observer = ^() { [weakSelf updateColorControlsEnabled]; };
++
++    [self defineControl:_hdrTextBrightness
++                    key:KEY_HDR_TEXT_BRIGHTNESS
++            displayName:NSLocalizedStringWithDefaultValue(@"ProfilesColors.HDRTextBrightness", nil, [NSBundle mainBundle], @"HDR text brightness", @"Display name for the slider that sets the brightness of HDR text, used by settings search")
++                   type:kPreferenceInfoTypeSlider];
++
+     [self defineControl:_hdrCursorBrightness
+                     key:KEY_HDR_CURSOR_BRIGHTNESS
+             displayName:NSLocalizedStringWithDefaultValue(@"ProfilesColors.HDRCursorBrightness", nil, [NSBundle mainBundle], @"HDR cursor brightness", @"Display name for the slider that sets the peak brightness of the HDR cursor, used by settings search")
+@@ -469,12 +486,70 @@ static NSString * const kColorGalleryURL = @"https://www.iterm2.com/colorgallery
+     _bwWarning2.hidden = hidden;
+ }
+ 
++// Builds the HDR text checkbox and slider in the empty space to the right of the
++// HDR cursor checkbox and slider, mirroring their layout. The pane uses fixed
++// frames, so position them from the HDR cursor controls' frames.
++- (void)installHDRTextControls {
++    NSView *container = _hdrCursor.superview;
++    if (!container || _hdrText) {
++        return;
++    }
++    const CGFloat gap = 8;
++    const NSRect cursorCheckboxFrame = _hdrCursor.frame;
++    const CGFloat x = NSMaxX(cursorCheckboxFrame) + gap;
++    const CGFloat width = MAX(120, NSWidth(container.bounds) - x);
++
++    // Same class the xib uses for its checkboxes; looked up by name so this does
++    // not depend on how the Swift class is exposed to Objective-C.
++    Class checkboxClass = NSClassFromString(@"iTermSettingsCheckbox") ?: [NSButton class];
++    NSButton *checkbox = [[checkboxClass alloc] initWithFrame:NSMakeRect(x,
++                                                                         NSMinY(cursorCheckboxFrame),
++                                                                         width,
++                                                                         NSHeight(cursorCheckboxFrame))];
++    [checkbox setButtonType:NSButtonTypeSwitch];
++    checkbox.title = NSLocalizedStringWithDefaultValue(@"ProfilesColors.HDRText", nil, [NSBundle mainBundle], @"HDR text in focused pane", @"Checkbox title: draw the focused pane's text brighter than white on HDR displays");
++    checkbox.font = [NSFont systemFontOfSize:[NSFont systemFontSize]];
++    checkbox.toolTip = NSLocalizedStringWithDefaultValue(@"ProfilesColors.HDRTextToolTip", nil, [NSBundle mainBundle], @"When enabled, and when the current display can use HDR (High Dynamic Range), text in the focused pane is drawn brighter than any white that normally appears in an application. Only applies over a dark background and with the GPU renderer. Turned off while Night Shift is on unless changed in Advanced settings.", @"Tooltip for the HDR text checkbox");
++    checkbox.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
++    checkbox.target = self;
++    checkbox.action = @selector(settingChanged:);
++    [container addSubview:checkbox];
++    _hdrText = checkbox;
++
++    // Match the HDR cursor slider's vertical position and size, indented under
++    // the new checkbox the same way the cursor slider is indented under its own.
++    const NSRect cursorSliderFrame = [container convertRect:_hdrCursorBrightness.bounds
++                                                   fromView:_hdrCursorBrightness];
++    const CGFloat indent = NSMinX(cursorSliderFrame) - NSMinX(cursorCheckboxFrame);
++    const CGFloat sliderX = x + MAX(0, indent);
++    const CGFloat sliderWidth = MIN(NSWidth(cursorSliderFrame), NSWidth(container.bounds) - sliderX);
++    NSSlider *slider = [[NSSlider alloc] initWithFrame:NSMakeRect(sliderX,
++                                                                  NSMinY(cursorSliderFrame),
++                                                                  MAX(80, sliderWidth),
++                                                                  NSHeight(cursorSliderFrame))];
++    slider.minValue = iTermHDRTextMinimumBrightness;
++    slider.maxValue = iTermHDRTextMaximumBrightness;
++    // Half steps from the minimum to the maximum.
++    slider.numberOfTickMarks = (NSInteger)round((iTermHDRTextMaximumBrightness - iTermHDRTextMinimumBrightness) / 0.5) + 1;
++    slider.allowsTickMarkValuesOnly = YES;
++    slider.tickMarkPosition = NSTickMarkPositionAbove;
++    slider.continuous = YES;
++    slider.doubleValue = iTermHDRTextDefaultBrightness;
++    slider.toolTip = NSLocalizedStringWithDefaultValue(@"ProfilesColors.HDRTextBrightnessToolTip", nil, [NSBundle mainBundle], @"Brightness of HDR text, as a multiple of normal white. Dim colors get brighter by the same factor. The display shows at most what its HDR headroom allows.", @"Tooltip for the HDR text brightness slider");
++    slider.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
++    slider.target = self;
++    slider.action = @selector(settingChanged:);
++    [container addSubview:slider];
++    _hdrTextBrightness = slider;
++}
++
+ - (void)updateColorControlsEnabled {
+     _tabColor.enabled = [self boolForKey:KEY_USE_TAB_COLOR];
+     _selectedTextColor.enabled = [self boolForKey:KEY_USE_SELECTED_TEXT_COLOR];
+     _underlineColor.enabled = [self boolForKey:KEY_USE_UNDERLINE_COLOR];
+     _activePaneBorderColor.enabled = [self boolForKey:KEY_USE_ACTIVE_PANE_BORDER];
+     _hdrCursorBrightness.enabled = [self boolForKey:KEY_HDR_CURSOR];
++    _hdrTextBrightness.enabled = [self boolForKey:KEY_HDR_TEXT];
+ 
+     const BOOL smartCursorColorSelected = [self boolForKey:KEY_SMART_CURSOR_COLOR];
+     const BOOL shouldEnableSmartCursorColor = ([self intForKey:KEY_CURSOR_TYPE] == CURSOR_BOX);
+diff --git a/sources/Settings/iTermAdvancedSettingsModel.h b/sources/Settings/iTermAdvancedSettingsModel.h
+index 0c2541fb2..bab8b1bfb 100644
+--- a/sources/Settings/iTermAdvancedSettingsModel.h
++++ b/sources/Settings/iTermAdvancedSettingsModel.h
+@@ -532,6 +532,7 @@ extern NSString *const iTermAdvancedSettingsDidChange;
+ + (int)wordSelectionRegexRadius;
+ + (BOOL)solidUnderlines;
+ + (BOOL)useMultiPassUnderlineRenderer;
+++ (BOOL)hdrTextOffDuringNightShift;
+ + (NSString *)splitPaneColor;
+ + (CGFloat)splitPaneDividerWidth;
+ + (NSString *)paneTitleBarBackgroundColor;
+diff --git a/sources/Settings/iTermAdvancedSettingsModel.m b/sources/Settings/iTermAdvancedSettingsModel.m
+index f9105fb28..3c8263f31 100644
+--- a/sources/Settings/iTermAdvancedSettingsModel.m
++++ b/sources/Settings/iTermAdvancedSettingsModel.m
+@@ -650,6 +650,7 @@ DEFINE_BOOL(useLowPowerGPUWhenUnplugged, NO, SECTION_DRAWING, NSLocalizedStringW
+ DEFINE_BOOL(underlineHyperlinks, YES, SECTION_DRAWING, NSLocalizedStringWithDefaultValue(@"AdvancedSetting.underlineHyperlinks", nil, [NSBundle mainBundle], @"Underline OSC 8 hyperlinks", @"Advanced setting: underlineHyperlinks"));
+ DEFINE_BOOL(solidUnderlines, NO, SECTION_DRAWING, NSLocalizedStringWithDefaultValue(@"AdvancedSetting.solidUnderlines", nil, [NSBundle mainBundle], @"Use solid underlines?\nWhen disabled, underlines break near text that would intersect them.", @"Advanced setting: solidUnderlines"));
+ DEFINE_BOOL(useMultiPassUnderlineRenderer, YES, SECTION_DRAWING, NSLocalizedStringWithDefaultValue(@"AdvancedSetting.useMultiPassUnderlineRenderer", nil, [NSBundle mainBundle], @"Use multi-pass underline renderer?\nFixes underline gaps with ligature fonts. Requires restart.", @"Advanced setting: useMultiPassUnderlineRenderer"));
++DEFINE_BOOL(hdrTextOffDuringNightShift, YES, SECTION_DRAWING, NSLocalizedStringWithDefaultValue(@"AdvancedSetting.hdrTextOffDuringNightShift", nil, [NSBundle mainBundle], @"Turn off HDR text while Night Shift is on?\nHDR text is enabled per profile in Settings > Profiles > Colors. When this is on, the focused pane goes back to normal brightness while Night Shift is warming the display.", @"Advanced setting: hdrTextOffDuringNightShift"));
+ DEFINE_SETTABLE_BOOL(showMetalFPSmeter, ShowMetalFPSmeter, NO, SECTION_DRAWING, NSLocalizedStringWithDefaultValue(@"AdvancedSetting.showMetalFPSmeter", nil, [NSBundle mainBundle], @"Show FPS meter\nRequires Metal renderer", @"Advanced setting: showMetalFPSmeter"));
+ DEFINE_BOOL(allowHDR, NO, SECTION_DRAWING, NSLocalizedStringWithDefaultValue(@"AdvancedSetting.allowHDR", nil, [NSBundle mainBundle], @"Allow HDR effects\nWhen enabled, iTerm2 may render some UI effects, such as the selected tab's outline, brighter than white on an HDR-capable display. Off by default because forcing the display into extended dynamic range can cause hangs on some systems.", @"Advanced setting: allowHDR"));
+ DEFINE_FLOAT(metalRedrawPeriod, 0.5, SECTION_DRAWING, NSLocalizedStringWithDefaultValue(@"AdvancedSetting.metalRedrawPeriod", nil, [NSBundle mainBundle], @"GPU renderer redraws at least this often, in seconds.\nThis is to work around a problem where the GPU renderer encounters a lot of latency when drawing for the first time after a short period of inactivity. Set this to a big number to render it ineffectual.", @"Advanced setting: metalRedrawPeriod"));
+diff --git a/sources/Settings/iTermProfilePreferences.m b/sources/Settings/iTermProfilePreferences.m
+index a06defdb7..0ae06345a 100644
+--- a/sources/Settings/iTermProfilePreferences.m
++++ b/sources/Settings/iTermProfilePreferences.m
+@@ -353,6 +353,10 @@ static NSString *const iTermBindingOwnerPalette = @"palette";
+             KEY_HDR_CURSOR COLORS_DARK_MODE_SUFFIX,
+             KEY_HDR_CURSOR,
+ 
++            KEY_HDR_TEXT COLORS_LIGHT_MODE_SUFFIX,
++            KEY_HDR_TEXT COLORS_DARK_MODE_SUFFIX,
++            KEY_HDR_TEXT,
++
+             KEY_USE_BOLD_COLOR,
+             KEY_USE_BOLD_COLOR COLORS_LIGHT_MODE_SUFFIX,
+             KEY_USE_BOLD_COLOR COLORS_DARK_MODE_SUFFIX,
+@@ -451,6 +455,10 @@ static NSString *const iTermBindingOwnerPalette = @"palette";
+             KEY_HDR_CURSOR_BRIGHTNESS COLORS_DARK_MODE_SUFFIX,
+             KEY_HDR_CURSOR_BRIGHTNESS,
+ 
++            KEY_HDR_TEXT_BRIGHTNESS COLORS_LIGHT_MODE_SUFFIX,
++            KEY_HDR_TEXT_BRIGHTNESS COLORS_DARK_MODE_SUFFIX,
++            KEY_HDR_TEXT_BRIGHTNESS,
++
+             KEY_CURSOR_TYPE, KEY_THIN_STROKES,
+ 
+             KEY_UNICODE_NORMALIZATION, KEY_HORIZONTAL_SPACING, KEY_VERTICAL_SPACING,
+@@ -700,6 +708,10 @@ static NSString *const iTermBindingOwnerPalette = @"palette";
+             KEY_HDR_CURSOR COLORS_DARK_MODE_SUFFIX:                 @"Whether to draw the cursor as bright HDR white on capable displays in dark mode",
+             KEY_HDR_CURSOR_BRIGHTNESS COLORS_LIGHT_MODE_SUFFIX:     @"Peak brightness of the HDR cursor as a multiple of reference white in light mode",
+             KEY_HDR_CURSOR_BRIGHTNESS COLORS_DARK_MODE_SUFFIX:      @"Peak brightness of the HDR cursor as a multiple of reference white in dark mode",
++            KEY_HDR_TEXT COLORS_LIGHT_MODE_SUFFIX:                  @"Whether to draw the focused pane’s text brighter than white on capable displays in light mode",
++            KEY_HDR_TEXT COLORS_DARK_MODE_SUFFIX:                   @"Whether to draw the focused pane’s text brighter than white on capable displays in dark mode",
++            KEY_HDR_TEXT_BRIGHTNESS COLORS_LIGHT_MODE_SUFFIX:       @"Brightness of HDR text as a multiple of reference white in light mode",
++            KEY_HDR_TEXT_BRIGHTNESS COLORS_DARK_MODE_SUFFIX:        @"Brightness of HDR text as a multiple of reference white in dark mode",
+             KEY_MINIMUM_CONTRAST COLORS_LIGHT_MODE_SUFFIX:          @"Minimum contrast ratio between text and background in light mode",
+             KEY_MINIMUM_CONTRAST COLORS_DARK_MODE_SUFFIX:           @"Minimum contrast ratio between text and background in dark mode",
+             KEY_FAINT_TEXT_ALPHA COLORS_LIGHT_MODE_SUFFIX:          @"Opacity of faint (dim) text in light mode",
+@@ -767,6 +779,8 @@ static NSString *const iTermBindingOwnerPalette = @"palette";
+             KEY_SMART_CURSOR_COLOR:                                 @"Whether cursor color is based on underlying text",
+             KEY_HDR_CURSOR:                                         @"Whether to draw the cursor as bright HDR white on capable displays",
+             KEY_HDR_CURSOR_BRIGHTNESS:                              @"Peak brightness of the HDR cursor as a multiple of reference white",
++            KEY_HDR_TEXT:                                           @"Whether to draw the focused pane’s text brighter than white on capable displays",
++            KEY_HDR_TEXT_BRIGHTNESS:                                @"Brightness of HDR text as a multiple of reference white",
+             KEY_MINIMUM_CONTRAST:                                   @"Minimum contrast ratio between text and background",
+             KEY_FAINT_TEXT_ALPHA:                                   @"Opacity of faint (dim) text",
+             KEY_CURSOR_BOOST:                                       @"Amount to dim non-cursor text to highlight cursor",
+@@ -1116,6 +1130,14 @@ static NSString *const iTermBindingOwnerPalette = @"palette";
+                   KEY_HDR_CURSOR_BRIGHTNESS COLORS_LIGHT_MODE_SUFFIX: @(iTermHDRCursorMaximumBrightness),
+                   KEY_HDR_CURSOR_BRIGHTNESS COLORS_DARK_MODE_SUFFIX: @(iTermHDRCursorMaximumBrightness),
+ 
++                  KEY_HDR_TEXT: @NO,
++                  KEY_HDR_TEXT COLORS_LIGHT_MODE_SUFFIX: @NO,
++                  KEY_HDR_TEXT COLORS_DARK_MODE_SUFFIX: @NO,
++
++                  KEY_HDR_TEXT_BRIGHTNESS: @(iTermHDRTextDefaultBrightness),
++                  KEY_HDR_TEXT_BRIGHTNESS COLORS_LIGHT_MODE_SUFFIX: @(iTermHDRTextDefaultBrightness),
++                  KEY_HDR_TEXT_BRIGHTNESS COLORS_DARK_MODE_SUFFIX: @(iTermHDRTextDefaultBrightness),
++
+                   KEY_CURSOR_TYPE: @(CURSOR_BOX),
+                   KEY_BLINKING_CURSOR: @NO,
+                   KEY_CURSOR_SHADOW: @NO,
+diff --git a/sources/TerminalView/PTYTextView.h b/sources/TerminalView/PTYTextView.h
+index afa022a92..877fe9952 100644
+--- a/sources/TerminalView/PTYTextView.h
++++ b/sources/TerminalView/PTYTextView.h
+@@ -504,6 +504,8 @@ extern const CGFloat PTYTextViewMarginClickGraceWidth;
+ @property(nonatomic, assign) BOOL useSmartCursorColor;
+ @property(nonatomic, assign) BOOL hdrCursorEnabled;
+ @property(nonatomic, assign) CGFloat hdrCursorBrightness;
++@property(nonatomic, assign) BOOL hdrTextEnabled;
++@property(nonatomic, assign) CGFloat hdrTextBrightness;
+ 
+ // Transparency level. 0 to 1.
+ @property(nonatomic, assign) double transparency;
+diff --git a/sources/TerminalView/PTYTextView.m b/sources/TerminalView/PTYTextView.m
+index 664079da6..c7aad00f6 100644
+--- a/sources/TerminalView/PTYTextView.m
++++ b/sources/TerminalView/PTYTextView.m
+@@ -2081,6 +2081,8 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
+     helper.useSmartCursorColor = _drawingHelper.useSmartCursorColor;
+     helper.hdrCursorEnabled = _drawingHelper.hdrCursorEnabled;
+     helper.hdrCursorBrightness = _drawingHelper.hdrCursorBrightness;
++    helper.hdrTextEnabled = _drawingHelper.hdrTextEnabled;
++    helper.hdrTextBrightness = _drawingHelper.hdrTextBrightness;
+ 
+     if (forOffscreen) {
+         // Offscreen rendering: disable all interactive features
+@@ -2769,6 +2771,30 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
+     return _drawingHelper.hdrCursorBrightness;
+ }
+ 
++- (void)setHdrTextEnabled:(BOOL)value {
++    if (_drawingHelper.hdrTextEnabled == value) {
++        return;
++    }
++    _drawingHelper.hdrTextEnabled = value;
++    [self requestDelegateRedraw];
++}
++
++- (BOOL)hdrTextEnabled {
++    return _drawingHelper.hdrTextEnabled;
++}
++
++- (void)setHdrTextBrightness:(CGFloat)value {
++    if (_drawingHelper.hdrTextBrightness == value) {
++        return;
++    }
++    _drawingHelper.hdrTextBrightness = value;
++    [self requestDelegateRedraw];
++}
++
++- (CGFloat)hdrTextBrightness {
++    return _drawingHelper.hdrTextBrightness;
++}
++
+ - (void)setMinimumContrast:(double)value {
+     DLog(@"Text view's min contrast for delegate %p is %f", self.delegate, value);
+     _drawingHelper.minimumContrast = value;
+diff --git a/sources/TerminalView/SessionView.h b/sources/TerminalView/SessionView.h
+index 65fc7f793..cc3a3455f 100644
+--- a/sources/TerminalView/SessionView.h
++++ b/sources/TerminalView/SessionView.h
+@@ -272,6 +272,17 @@ typedef NS_ENUM(NSUInteger, iTermSessionViewFindDriver) {
+ // baked into pipeline states); PTYSession does that via -bounceMetal.
+ @property (nonatomic) BOOL hdrCursorEnabled;
+ 
++// The session's per-profile HDR-text setting (KEY_HDR_TEXT). Like
++// hdrCursorEnabled it makes the metal framebuffer fp16, so changing it while the
++// metal renderer is active also requires a driver rebuild. The text is only
++// actually brightened in the focused pane; see iTermCursor's
++// hdrTextGainForRequestedBrightness:.
++@property (nonatomic) BOOL hdrTextEnabled;
++
++// YES when either HDR feature needs the fp16 framebuffer. This decides the
++// metal pixel format.
++@property (nonatomic, readonly) BOOL wantsHDRFramebuffer;
++
+ @property (nonatomic) VT100ScreenProgress progress;
+ @property (nonatomic) BOOL enableProgressBars;
+ @property (nonatomic) BOOL showInlineProgressBar;
+diff --git a/sources/TerminalView/SessionView.m b/sources/TerminalView/SessionView.m
+index 4fc52d459..a6c8ec027 100644
+--- a/sources/TerminalView/SessionView.m
++++ b/sources/TerminalView/SessionView.m
+@@ -312,6 +312,13 @@ NSString *const SessionViewWasSelectedForInspectionNotification = @"SessionViewW
+ 
+         [self installLegacyView];
+         [self installHDREngager];
++        // HDR text is turned off while Night Shift is on (see
++        // +[iTermCursor hdrTextSuppressedByNightShift]); release or re-engage
++        // EDR and redraw when that flips.
++        [[NSNotificationCenter defaultCenter] addObserver:self
++                                                 selector:@selector(nightShiftDidChange:)
++                                                     name:iTermNightShiftDidChangeNotification
++                                                   object:nil];
+ 
+ #if ENABLE_LOW_POWER_GPU_DETECTION
+         [[NSNotificationCenter defaultCenter] addObserver:self
+@@ -942,13 +949,48 @@ NSString *const SessionViewWasSelectedForInspectionNotification = @"SessionViewW
+ 
+ - (void)setHdrCursorEnabled:(BOOL)hdrCursorEnabled {
+     _hdrCursorEnabled = hdrCursorEnabled;
++    [self updateHDRState];
++}
++
++- (void)setHdrTextEnabled:(BOOL)hdrTextEnabled {
++    _hdrTextEnabled = hdrTextEnabled;
++    [self updateHDRState];
++}
++
++- (BOOL)wantsHDRFramebuffer {
++    return _hdrCursorEnabled || _hdrTextEnabled;
++}
++
++// Whether something in this session can draw above reference white right now.
++// HDR text is Metal-only and drops out while Night Shift suppresses it, so for
++// text alone EDR is released while the legacy renderer is in use (by default
++// iTerm2 switches to it on battery) or Night Shift is on. The HDR cursor works in
++// both renderers and keeps its original always-engaged behavior.
++- (BOOL)wantsEDREngaged {
++    if (_hdrCursorEnabled) {
++        return YES;
++    }
++    return (_hdrTextEnabled &&
++            _metalView != nil &&
++            ![iTermCursor hdrTextSuppressedByNightShift]);
++}
++
++- (void)updateHDRState {
+     // The engager engages/releases EDR based on this. Its layer work is cheap and
+     // can update live.
+-    _hdrEngager.enabled = hdrCursorEnabled;
++    _hdrEngager.enabled = [self wantsEDREngaged];
+     // The metal view's EDR engagement is a layer property that can update live;
+     // its pixel format cannot, so a format change is handled separately by
+     // rebuilding the driver (PTYSession -> bounceMetal). Keep the live part synced.
+-    _metalView.wantsHDR = hdrCursorEnabled;
++    _metalView.wantsHDR = self.wantsHDRFramebuffer;
++}
++
++- (void)nightShiftDidChange:(NSNotification *)notification {
++    if (!_hdrTextEnabled) {
++        return;
++    }
++    [self updateHDRState];
++    [self requestRedraw];
+ }
+ 
+ - (void)installHDREngager {
+@@ -961,7 +1003,7 @@ NSString *const SessionViewWasSelectedForInspectionNotification = @"SessionViewW
+     // can react live when the setting is flipped on for an existing session.
+     // Keeping it also means tearing down the Metal view never drops EDR.
+     _hdrEngager = [[iTermHDREngager alloc] initWithFrame:NSMakeRect(0, 0, 1, 1)];
+-    _hdrEngager.enabled = _hdrCursorEnabled;
++    _hdrEngager.enabled = [self wantsEDREngaged];
+     [self insertSubview:_hdrEngager atIndex:_contentViewIndex];
+ }
+ 
+@@ -1029,10 +1071,11 @@ NSString *const SessionViewWasSelectedForInspectionNotification = @"SessionViewW
+ #else
+     _metalView.layer.opaque = YES;
+ #endif
+-    _metalView.wantsHDR = _hdrCursorEnabled;
+-    if (_hdrCursorEnabled) {
+-        // Make the layer fp16 so the cursor can exceed reference white. Must match
+-        // the driver's framebufferPixelFormat below.
++    const BOOL wantsHDRFramebuffer = self.wantsHDRFramebuffer;
++    _metalView.wantsHDR = wantsHDRFramebuffer;
++    if (wantsHDRFramebuffer) {
++        // Make the layer fp16 so the cursor and text can exceed reference white.
++        // Must match the driver's framebufferPixelFormat below.
+         [_metalView enableHDR];
+     }
+     // The metal view's color space is managed by iTermMTKView.preferredColorspace
+@@ -1053,10 +1096,13 @@ NSString *const SessionViewWasSelectedForInspectionNotification = @"SessionViewW
+     _metalView.hidden = self.isBrowser;
+     _metalView.alphaValue = 0;
+ 
++    // HDR text can only render now that a Metal view exists.
++    _hdrEngager.enabled = [self wantsEDREngaged];
++
+     // Start the metal driver going. It will receive delegate calls from iTermMTKView that kick off
+     // frame rendering.
+     _driver = [[iTermMetalDriver alloc] initWithDevice:_metalView.device
+-                                framebufferPixelFormat:iTermMetalFramebufferPixelFormat(_hdrCursorEnabled)];
++                                framebufferPixelFormat:iTermMetalFramebufferPixelFormat(wantsHDRFramebuffer)];
+     _driver.dataSource = dataSource;
+     [_driver metalView:_metalView drawableSizeWillChange:_metalView.drawableSize];
+     _metalView.delegate = _driver;
+@@ -1075,6 +1121,9 @@ NSString *const SessionViewWasSelectedForInspectionNotification = @"SessionViewW
+     _driver = nil;
+     _metalClipView.useMetal = NO;
+     _metalClipView.metalView = nil;
++    // Without a Metal view HDR text cannot render, so stop holding EDR for it.
++    // The HDR cursor, if on, still keeps it engaged.
++    _hdrEngager.enabled = [self wantsEDREngaged];
+     [_hdrEngager reengage];
+     [self metalViewVisibilityDidChange];
+ }
+-- 
+2.51.2
+
